@@ -8,19 +8,42 @@
 
 ---
 
-## Install (one command)
+## Install
+
+### 🍎 macOS / Linux
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Theanlegendary/orcli/main/install.sh | zsh
 ```
 
-Then set up your free API key:
-
+Then:
 ```bash
-orcli --auth
+orcli --auth    # set up your free API key
+orcli           # start chatting
 ```
 
-Get a free key at → **https://openrouter.ai/keys**
+Or **double-click `orcli.command`** on your Desktop.
+
+---
+
+### 🪟 Windows
+
+1. Make sure **Python 3** is installed → [python.org/downloads](https://python.org/downloads)  
+   *(check "Add Python to PATH" during install)*
+
+2. Download and run **[install.bat](https://raw.githubusercontent.com/Theanlegendary/orcli/main/install.bat)**
+
+3. **Double-click `orcli.bat`** on your Desktop → instant AI chat!
+
+Or manually in PowerShell:
+```powershell
+# Download orcli
+Invoke-WebRequest -Uri "https://raw.githubusercontent.com/Theanlegendary/orcli/main/orcli" -OutFile "$env:USERPROFILE\.local\bin\orcli"
+# Download launcher
+Invoke-WebRequest -Uri "https://raw.githubusercontent.com/Theanlegendary/orcli/main/orcli.bat" -OutFile "$env:USERPROFILE\Desktop\orcli.bat"
+# Set up API key
+python "$env:USERPROFILE\.local\bin\orcli" --auth
+```
 
 ---
 
@@ -29,10 +52,11 @@ Get a free key at → **https://openrouter.ai/keys**
 ```
 orcli                  # start chatting
 orcli "explain git"    # one-shot question
-cat error.log | orcli  # pipe text to AI
+cat error.log | orcli  # pipe text to AI (Mac/Linux)
+type error.log | python orcli  # pipe text to AI (Windows)
 ```
 
-Or **double-click `orcli.command`** on your Desktop to launch instantly.
+Get a free API key at → **https://openrouter.ai/keys**
 
 ---
 
