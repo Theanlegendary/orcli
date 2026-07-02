@@ -1137,7 +1137,7 @@ def chat(models, theme_name, cfg):
 #  MAIN
 # ──────────────────────────────────────────────────────
 def main():
-    global T
+    global T, API_KEY
     parser = argparse.ArgumentParser(prog="orcli", add_help=False)
     parser.add_argument("--theme", default=None)
     parser.add_argument("--list-themes", action="store_true")
