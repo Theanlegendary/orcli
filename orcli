@@ -1,0 +1,1271 @@
+#!/usr/bin/env python3
+"""
+orcli v7.0 — OpenRouter CLI  (Messenger Edition)
+Chat persistence · /file · /resume · Smart context · Seen indicators
+"""
+import os, sys, json, time, re, threading, textwrap, datetime, shutil, argparse, subprocess
+import urllib.request, urllib.error
+try:
+    import readline
+except ImportError:
+    pass
+
+# ──────────────────────────────────────────────────────
+#  CONFIG
+# ──────────────────────────────────────────────────────
+API_KEY   = os.environ.get("OPENROUTER_API_KEY", "")
+RC_FILE   = os.path.expanduser("~/.zshrc") if os.environ.get("SHELL","").endswith("zsh") else os.path.expanduser("~/.bashrc")
+BASE_URL  = "https://openrouter.ai/api/v1"
+VERSION   = "7.0"
+CFG_FILE  = os.path.expanduser("~/.orcli-config.json")
+HISTORY_DIR = os.path.expanduser("~/.orcli-history")
+
+SYSTEM_PROMPT = (
+    "You are a highly capable AI assistant running in a terminal. "
+    "Be concise, accurate, and thoughtful. When writing code, always specify "
+    "the language in fenced code blocks. Use markdown — headers, bullets, bold.\n\n"
+    "CRITICAL: The user's terminal client (orcli) has a Local Execution Engine. "
+    "If you output shell commands inside ```bash ... ``` or python code inside ```python ... ```, "
+    "the client will ask the user's permission to run them locally. "
+    "Therefore, you CAN suggest commands (e.g. 'cd downloads/taskflow-saas', 'npm install', "
+    "'python script.py') and the user can easily run them with 'y'."
+)
+
+CODING_PRIORITY = [
+    "deepseek/deepseek-r1", "deepseek/deepseek-r1-0528",
+    "deepseek/deepseek-prover-v2", "qwen/qwen3-235b-a22b",
+    "qwen/qwen3-30b-a3b", "qwen/qwen3-14b",
+    "qwen/qwen-2.5-coder-32b-instruct", "qwen/qwen-2.5-72b-instruct",
+    "google/gemini-2.0-flash-thinking-exp", "google/gemma-3-27b-it",
+    "meta-llama/llama-3.3-70b-instruct", "microsoft/phi-4",
+    "mistralai/mistral-small-3.2-24b-instruct",
+]
+
+# ──────────────────────────────────────────────────────
+#  ANSI PRIMITIVES
+# ──────────────────────────────────────────────────────
+def _a(*c): return "\033[" + ";".join(str(x) for x in c) + "m"
+def _fg(n):  return _a(38, 5, n)   # 256-color fg
+def _bg(n):  return _a(48, 5, n)   # 256-color bg
+
+RST    = _a(0)
+BOLD   = _a(1); DIM    = _a(2); ITALIC = _a(3); UL = _a(4)
+
+def col(text, *styles): return "".join(styles) + str(text) + RST
+
+def tw():
+    return min(shutil.get_terminal_size((88, 24)).columns, 108)
+
+# Emoji display width
+WIDE = frozenset('🤖🧠💬🧑✅❌⚠💰📊🔄⚡🌙👋🚀⭐🆓🔁🔍💡📋✨🎯🧪🔧⏳🆙📌🔴🟡🟢🎨🕒💻⚙')
+def dw(s):
+    plain = re.sub(r'\033\[[^m]*m', '', str(s))
+    return sum(2 if c in WIDE else 1 for c in plain)
+
+def reapply_bg(text, bg):
+    return text.replace(RST, RST + bg)
+
+def clear_line():  sys.stdout.write("\r\033[2K"); sys.stdout.flush()
+def hide_cursor(): sys.stdout.write("\033[?25l"); sys.stdout.flush()
+def show_cursor(): sys.stdout.write("\033[?25h"); sys.stdout.flush()
+
+# ──────────────────────────────────────────────────────
+#  THEME SYSTEM
+# ──────────────────────────────────────────────────────
+THEMES = {
+    "dracula": {
+        "text":      _fg(253),
+        "dim_text":  _fg(245),
+        "muted":     _fg(240),
+        "accent1":   _fg(141),   # purple
+        "accent2":   _fg(117),   # cyan
+        "accent3":   _fg(84),    # green
+        "accent4":   _fg(228),   # yellow
+        "accent5":   _fg(212),   # pink
+        "accent6":   _fg(215),   # orange
+        "error":     _fg(203),   # red
+        "border":    _fg(61),
+        "border2":   _fg(97),
+        "bg_code":   _bg(236),
+        "bg_think":  _bg(17),
+        "bg_status": _bg(237),
+        "bg_label":  _bg(57),
+        "label_fg":  _fg(255),
+    },
+    "nord": {
+        "text":      _fg(252),
+        "dim_text":  _fg(246),
+        "muted":     _fg(240),
+        "accent1":   _fg(110),
+        "accent2":   _fg(116),
+        "accent3":   _fg(150),
+        "accent4":   _fg(222),
+        "accent5":   _fg(210),
+        "accent6":   _fg(179),
+        "error":     _fg(203),
+        "border":    _fg(67),
+        "border2":   _fg(110),
+        "bg_code":   _bg(237),
+        "bg_think":  _bg(18),
+        "bg_status": _bg(238),
+        "bg_label":  _bg(24),
+        "label_fg":  _fg(255),
+    },
+    "monokai": {
+        "text":      _fg(253),
+        "dim_text":  _fg(244),
+        "muted":     _fg(239),
+        "accent1":   _fg(141),
+        "accent2":   _fg(81),
+        "accent3":   _fg(148),
+        "accent4":   _fg(221),
+        "accent5":   _fg(197),
+        "accent6":   _fg(208),
+        "error":     _fg(197),
+        "border":    _fg(95),
+        "border2":   _fg(131),
+        "bg_code":   _bg(235),
+        "bg_think":  _bg(23),
+        "bg_status": _bg(237),
+        "bg_label":  _bg(29),
+        "label_fg":  _fg(148),
+    },
+    "cyberpunk": {
+        "text":      _fg(252),
+        "dim_text":  _fg(245),
+        "muted":     _fg(239),
+        "accent1":   _fg(201),
+        "accent2":   _fg(51),
+        "accent3":   _fg(118),
+        "accent4":   _fg(226),
+        "accent5":   _fg(201),
+        "accent6":   _fg(208),
+        "error":     _fg(196),
+        "border":    _fg(56),
+        "border2":   _fg(93),
+        "bg_code":   _bg(233),
+        "bg_think":  _bg(17),
+        "bg_status": _bg(234),
+        "bg_label":  _bg(53),
+        "label_fg":  _fg(201),
+    },
+    "ark": {
+        # Ark Theme — Cool blue-grey background, slate tones, bright accents
+        "text":      _fg(252),   # soft grey
+        "dim_text":  _fg(244),   # slate grey
+        "muted":     _fg(238),   # dark slate
+        "accent1":   _fg(110),   # soft blue (#5294e2)
+        "accent2":   _fg(111),   # light blue (#4b85c1)
+        "accent3":   _fg(150),   # soft green (#8dc63f)
+        "accent4":   _fg(221),   # soft yellow
+        "accent5":   _fg(104),   # soft purple (#7c83c3)
+        "accent6":   _fg(216),   # soft orange
+        "error":     _fg(203),   # flat red
+        "border":    _fg(60),    # slate border
+        "border2":   _fg(110),
+        "bg_code":   _bg(237),   # dark slate bg
+        "bg_think":  _bg(17),    # dark navy
+        "bg_status": _bg(235),
+        "bg_label":  _bg(60),
+        "label_fg":  _fg(255),
+    },
+}
+
+T = THEMES["ark"]
+
+def th(key):   return T.get(key, "")
+def text(s):   return col(s, T["text"])
+def dim(s):    return col(s, T["dim_text"])
+def muted(s):  return col(s, T["muted"])
+def accent(s, n=1): return col(s, T[f"accent{n}"])
+
+# ──────────────────────────────────────────────────────
+#  SPINNER
+# ──────────────────────────────────────────────────────
+class Spinner:
+    """Messenger-style 'typing' indicator with bouncing dots."""
+    DOT_FRAMES = ["·  ", "·· ", "···", " ··", "  ·", "   "]
+    def __init__(self, msg="AI is typing"):
+        self.msg = msg
+        self._stop = threading.Event()
+        self._t = threading.Thread(target=self._spin, daemon=True)
+    def _spin(self):
+        i = 0; hide_cursor()
+        while not self._stop.is_set():
+            dots = self.DOT_FRAMES[i % len(self.DOT_FRAMES)]
+            indicator = col(f"  💬 {self.msg} ", T["muted"], ITALIC) + col(dots, T["accent1"], BOLD)
+            sys.stdout.write(f"\r{indicator}"); sys.stdout.flush()
+            time.sleep(0.15); i += 1
+    def start(self): self._t.start()
+    def stop(self):
+        self._stop.set(); self._t.join(); clear_line(); show_cursor()
+
+# ──────────────────────────────────────────────────────
+#  SYNTAX HIGHLIGHTING
+# ──────────────────────────────────────────────────────
+def _kw(pat): return (pat, "keyword")
+def _str(pat): return (pat, "string")
+def _cmt(pat): return (pat, "comment")
+def _num(pat): return (pat, "number")
+def _fn2(pat): return (pat, "funcname")
+def _cls(pat): return (pat, "classname")
+def _dec(pat): return (pat, "decorator")
+
+def _apply_type(tok_type, full_match, groups):
+    if tok_type == "keyword":    return col(full_match, T["accent1"], BOLD)
+    if tok_type == "string":     return col(full_match, T["accent4"])
+    if tok_type == "string_val": return ": " + col(groups[0], T["accent4"])
+    if tok_type == "comment":    return col(full_match, T["muted"], ITALIC)
+    if tok_type == "number":     return col(full_match, T["accent5"])
+    if tok_type == "constant":   return col(full_match, T["accent2"])
+    if tok_type == "variable":   return col(full_match, T["accent6"])
+    if tok_type == "classname":  return col(full_match, T["accent2"], BOLD)
+    if tok_type == "decorator":  return col(full_match, T["accent2"], ITALIC)
+    if tok_type == "def_fn":
+        kw = full_match.split()[0]
+        nm = groups[0]
+        return col(kw, T["accent1"], BOLD) + " " + col(nm, T["accent3"], BOLD)
+    if tok_type == "def_cls":
+        kw = full_match.split()[0]
+        nm = groups[0]
+        return col(kw, T["accent1"], BOLD) + " " + col(nm, T["accent2"], BOLD)
+    if tok_type == "def_cls2":
+        parts = full_match.split()
+        kw = parts[0]
+        nm = groups[1] if len(groups) > 1 else groups[0]
+        return col(kw, T["accent1"], BOLD) + " " + col(nm, T["accent2"], BOLD)
+    return col(full_match, T["text"])
+
+PY_KW  = r'\b(return|import|from|if|elif|else|for|while|try|except|finally|with|as|in|not|and|or|is|True|False|None|pass|break|continue|yield|lambda|async|await|raise|global|nonlocal|del|assert)\b'
+JS_KW  = r'\b(const|let|var|return|if|else|for|while|do|import|export|from|async|await|new|this|typeof|instanceof|null|undefined|true|false|switch|case|break|default|throw|try|catch|finally)\b'
+SH_KW  = r'\b(if|then|else|elif|fi|for|do|done|while|until|case|esac|function|return|export|local|echo|cd|ls|grep|awk|sed|cat|mkdir|rm|cp|mv|chmod|sudo|source)\b'
+
+LANG_RULES = {
+    "python": [
+        (r'\bdef\s+(\w+)',   "def_fn"),
+        (r'\bclass\s+(\w+)', "def_cls"),
+        _kw(PY_KW),
+        _dec(r'@\w+[\w.]*'),
+        _str(r'"""[\s\S]*?"""|\'\'\'[\s\S]*?\'\'\''),
+        _str(r'f?"[^"\n\\]*(?:\\.[^"\n\\]*)*"|f?\'[^\'\n\\]*(?:\\.[^\'\n\\]*)*\''),
+        _cmt(r'#[^\n]*'),
+        _num(r'\b\d+\.?\d*(?:e[+-]?\d+)?\b'),
+        (r'\b([A-Z][A-Z0-9_]{2,})\b', "constant"),
+    ],
+    "javascript": [
+        (r'\bfunction\s+(\w+)', "def_fn"),
+        (r'\bclass\s+(\w+)',    "def_cls"),
+        _kw(JS_KW),
+        _cmt(r'//[^\n]*|/\*[\s\S]*?\*/'),
+        _str(r'`[^`]*`|"[^"]*"|\'[^\']*\''),
+        _num(r'\b\d+\.?\d*\b'),
+    ],
+    "bash": [
+        _kw(SH_KW),
+        _str(r'"(?:[^"\\]|\\.)*"|\'[^\']*\''),
+        (r'\$\w+|\$\{[^}]+\}|\$\([^)]+\)', "variable"),
+        _cmt(r'#[^\n]*'),
+        _num(r'\b\d+\b'),
+    ],
+    "json": [
+        (r'"(\w[\w\s]*)"(?=\s*:)', "def_fn"),
+        (r':\s*"([^"]*)"',         "string_val"),
+        _kw(r'\b(true|false|null)\b'),
+        _num(r'\b\d+\.?\d*\b'),
+    ],
+    "css": [
+        (r'([\w-]+)(?=\s*:(?!:))', "classname"),
+        (r':\s*([^;{}\n]+)',       "string_val"),
+        _cmt(r'/\*[\s\S]*?\*/'),
+        (r'#[0-9a-fA-F]{3,8}\b',  "constant"),
+        (r'@[\w-]+',               "keyword"),
+    ],
+    "sql": [
+        _kw(r'\b(SELECT|FROM|WHERE|JOIN|LEFT|RIGHT|INNER|OUTER|ON|AS|AND|OR|NOT|IN|IS|NULL|ORDER|BY|GROUP|HAVING|LIMIT|INSERT|INTO|VALUES|UPDATE|SET|DELETE|CREATE|TABLE|DROP|ALTER|INDEX|PRIMARY|KEY|FOREIGN|REFERENCES|UNIQUE|DEFAULT|COUNT|SUM|AVG|MAX|MIN|DISTINCT)\b'),
+        _str(r"'[^']*'"),
+        _cmt(r'--[^\n]*'),
+        _num(r'\b\d+\b'),
+    ],
+    "go": [
+        (r'\bfunc\s+(\w+)',    "def_fn"),
+        (r'\btype\s+(\w+)',    "def_cls"),
+        _kw(r'\b(package|import|var|const|if|else|for|range|return|func|type|struct|interface|map|chan|go|defer|select|case|default|break|continue|fallthrough|goto|nil|true|false)\b'),
+        _str(r'"(?:[^"\\]|\\.)*"|`[^`]*`'),
+        _cmt(r'//[^\n]*|/\*[\s\S]*?\*/'),
+        _num(r'\b\d+\.?\d*\b'),
+    ],
+    "rust": [
+        (r'\bfn\s+(\w+)',      "def_fn"),
+        (r'\b(struct|enum|trait|impl)\s+(\w+)', "def_cls2"),
+        _kw(r'\b(let|mut|const|use|mod|impl|trait|pub|fn|struct|enum|match|if|else|for|while|loop|return|self|Self|super|crate|true|false|None|Some|Ok|Err)\b'),
+        _str(r'"(?:[^"\\]|\\.)*"'),
+        _cmt(r'//[^\n]*|/\*[\s\S]*?\*/'),
+        _num(r'\b\d+\.?\d*\b'),
+        (r'&\w+|#\[[\w:,\s]*\]', "decorator"),
+    ],
+    "typescript": [
+        (r'\bfunction\s+(\w+)', "def_fn"),
+        (r'\b(class|interface|type|enum)\s+(\w+)', "def_cls2"),
+        _kw(JS_KW + r'|\b(type|interface|enum|implements|extends|abstract|readonly|as|keyof|never|any|void|string|number|boolean|object)\b'),
+        _cmt(r'//[^\n]*|/\*[\s\S]*?\*/'),
+        _str(r'`[^`]*`|"[^"]*"|\'[^\']*\''),
+        _num(r'\b\d+\.?\d*\b'),
+    ],
+}
+for a, b in [("js","javascript"),("ts","typescript"),("tsx","typescript"),
+             ("jsx","javascript"),("sh","bash"),("zsh","bash"),("py","python"),("rs","rust")]:
+    LANG_RULES[a] = LANG_RULES[b]
+
+def highlight(code, lang):
+    rules = LANG_RULES.get(lang.lower(), [])
+    result = code
+    for pat, tok_type in rules:
+        try:
+            def replacer(m, t=tok_type): return _apply_type(t, m.group(0), m.groups())
+            result = re.sub(pat, replacer, result, flags=re.MULTILINE)
+        except: pass
+    return result
+
+# ──────────────────────────────────────────────────────
+#  CODE BLOCK RENDER (Messenger Style)
+# ──────────────────────────────────────────────────────
+def render_code_block(lang, code):
+    W = tw()
+    label = lang.upper() if lang else "CODE"
+    # Clean pill-style label
+    hdr = col(f" {label} ", T["bg_label"], T["label_fg"], BOLD)
+    rows = [f"    {hdr}"]
+    for raw in code.rstrip().split("\n"):
+        hl   = highlight(raw, lang)
+        bg   = T["bg_code"]
+        hl_b = bg + reapply_bg(hl, bg)
+        pad  = " " * max(0, W - 8 - dw(raw))
+        rows.append(col("    ", bg) + hl_b + pad + RST)
+    return "\n" + "\n".join(rows) + "\n"
+
+# ──────────────────────────────────────────────────────
+#  MARKDOWN RENDER (Messenger Style)
+# ──────────────────────────────────────────────────────
+def render_md(text):
+    # 1. Protect code blocks
+    def sub_code(m):
+        return render_code_block((m.group(1) or "").strip(), m.group(2))
+    text = re.sub(r'```(\w*)\n?([\s\S]*?)```', sub_code, text)
+
+    # 2. Inline code
+    text = re.sub(r'`([^`\n]+)`',
+        lambda m: T["bg_code"] + T["accent2"] + " " + m.group(1) + " " + RST, text)
+
+    # 3. Bold + italic
+    text = re.sub(r'\*\*\*(.+?)\*\*\*', lambda m: col(m.group(1), BOLD, ITALIC, T["text"]), text)
+    text = re.sub(r'\*\*(.+?)\*\*',     lambda m: col(m.group(1), BOLD, T["text"]),          text)
+    text = re.sub(r'\*(.+?)\*',         lambda m: col(m.group(1), ITALIC, T["dim_text"]),    text)
+
+    # 4. Headers (Clean Messenger Style)
+    text = re.sub(r'^# (.+)$',    lambda m: "\n" + col("💬 " + m.group(1).upper(), T["accent1"], BOLD), text, flags=re.MULTILINE)
+    text = re.sub(r'^## (.+)$',   lambda m: "\n" + col("🔹 " + m.group(1), T["accent2"], BOLD), text, flags=re.MULTILINE)
+    text = re.sub(r'^### (.+)$',  lambda m: col("▪ " + m.group(1), T["accent2"], BOLD), text, flags=re.MULTILINE)
+
+    # 5. Lists
+    text = re.sub(r'^      [-*•] (.+)$', lambda m: "      ◦ " + col(m.group(1), T["dim_text"]), text, flags=re.MULTILINE)
+    text = re.sub(r'^    [-*•] (.+)$',   lambda m: "    ◦ " + col(m.group(1), T["dim_text"]), text, flags=re.MULTILINE)
+    text = re.sub(r'^  [-*•] (.+)$',     lambda m: "  ◦ " + col(m.group(1), T["dim_text"]), text, flags=re.MULTILINE)
+    text = re.sub(r'^[-*•] (.+)$',       lambda m: "• " + col(m.group(1), T["text"]), text, flags=re.MULTILINE)
+
+    # 6. Numbered list
+    text = re.sub(r'^(\d+)\. (.+)$',
+        lambda m: col(f"{m.group(1)}.", T["accent1"], BOLD) + " " + col(m.group(2), T["text"]),
+        text, flags=re.MULTILINE)
+
+    # 7. Blockquote
+    text = re.sub(r'^> (.+)$',
+        lambda m: col("│ ", T["accent1"], BOLD) + col(m.group(1), T["dim_text"], ITALIC),
+        text, flags=re.MULTILINE)
+
+    # 8. Horizontal rule
+    text = re.sub(r'^---+$', col("  " + "─"*(tw()-4), T["muted"]), text, flags=re.MULTILINE)
+
+    out = []
+    for ln in text.split("\n"):
+        plain = re.sub(r'\033\[[^m]*m', '', ln)
+        if plain.strip() and not ln.startswith("    ") and not ln.startswith("  ") and not ln.startswith("•") and not ln.startswith("💬") and not ln.startswith("🔹") and not ln.startswith("▪") and not ln.startswith("│"):
+            ln = "    " + col(plain, T["text"])
+        out.append(ln)
+    return "\n".join(out)
+
+# ──────────────────────────────────────────────────────
+#  THINKING
+# ──────────────────────────────────────────────────────
+def think_header():
+    sys.stdout.write(col("    🧠 thinking", T["muted"], ITALIC) + "\n")
+    sys.stdout.flush()
+
+def think_line(line):
+    W = tw()
+    content = col("    " + (line or "")[:W-8], T["muted"], ITALIC)
+    sys.stdout.write(content + "\n")
+    sys.stdout.flush()
+
+def think_footer():
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+
+# ──────────────────────────────────────────────────────
+#  LOCAL COMMAND EXECUTION ENGINE
+# ──────────────────────────────────────────────────────
+def execute_code_blocks(full_text, cfg):
+    """Finds executable code blocks and executes them with minimal prompting."""
+    blocks = re.findall(r'```(\w*)\n?([\s\S]*?)```', full_text)
+    if not blocks: return
+
+    executable_blocks = []
+    for lang, code in blocks:
+        lang_clean = lang.lower().strip()
+        if lang_clean in ("bash", "sh", "zsh", "python", "py"):
+            executable_blocks.append((lang_clean, code))
+
+    if not executable_blocks: return
+
+    mode = cfg.get("mode", "safe") # safe or auto
+
+    if mode == "auto":
+        print(col("\n    ⚙️  Running...", T["accent3"]))
+    else:
+        print()
+        prompt = col(f"    ▶ Run? [Y/n] ", T["accent3"], BOLD)
+        ch = input(prompt).strip().lower()
+        if ch in ('n', 'no'):
+            return
+
+    for idx, (lang, code) in enumerate(executable_blocks, 1):
+        print(col(f"\n    🚀 block #{idx} ({lang})", T["accent3"]))
+        print(col("    " + "─"*(tw()-8), T["muted"]))
+
+        if lang in ("bash", "sh", "zsh"):
+            tmp_pwd = "/tmp/orcli-pwd"
+            wrapper_script = code + f"\npwd > {tmp_pwd}"
+
+            try:
+                subprocess.run(wrapper_script, shell=True, text=True)
+                if os.path.exists(tmp_pwd):
+                    with open(tmp_pwd) as f:
+                        new_path = f.read().strip()
+                    if os.path.exists(new_path) and new_path != os.getcwd():
+                        os.chdir(new_path)
+                        print(col(f"    📂 {new_path}", T["accent2"]))
+                    try: os.remove(tmp_pwd)
+                    except: pass
+            except Exception as ex:
+                print(col(f"    ❌ {ex}", T["error"]))
+
+        elif lang in ("python", "py"):
+            try:
+                subprocess.run([sys.executable, "-c", code])
+            except Exception as ex:
+                print(col(f"    ❌ {ex}", T["error"]))
+
+        print(col("    " + "─"*(tw()-8), T["muted"]))
+        print(col("    ✓ done", T["accent3"]))
+
+# ──────────────────────────────────────────────────────
+#  API
+# ──────────────────────────────────────────────────────
+def _req(url, data=None, method="GET", timeout=30):
+    hdrs = {
+        "Authorization": f"Bearer {API_KEY}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://orcli.local",
+        "X-Title": f"orcli/{VERSION}",
+    }
+    body = json.dumps(data).encode() if data else None
+    req  = urllib.request.Request(url, data=body, headers=hdrs, method=method)
+    try:
+        return urllib.request.urlopen(req, timeout=timeout), None
+    except urllib.error.HTTPError as e:
+        return None, {"code": e.code, "body": e.read().decode("utf-8","replace")}
+    except Exception as ex:
+        return None, {"code": 0, "body": str(ex)}
+
+def get_models():
+    sp = Spinner("Fetching free models"); sp.start()
+    resp, err = _req(f"{BASE_URL}/models", timeout=15)
+    sp.stop()
+    if not resp:
+        print(col(f"  ❌  {err}", T["error"])); return []
+    data = json.loads(resp.read().decode("utf-8","replace")).get("data", [])
+    free = []
+    for m in data:
+        p = m.get("pricing", {})
+        try:
+            if float(p.get("prompt","1"))==0 and float(p.get("completion","1"))==0:
+                free.append(m)
+        except: pass
+    def rank(m):
+        mid = m["id"]
+        for i, p in enumerate(CODING_PRIORITY):
+            if p in mid: return (0, i, m.get("name",""))
+        return (1, 999, m.get("name",""))
+    return sorted(free, key=rank)
+
+def get_credits():
+    resp, _ = _req(f"{BASE_URL}/auth/key", timeout=10)
+    if not resp: return None
+    d = json.loads(resp.read().decode("utf-8","replace")).get("data", {})
+    lim, used = d.get("limit"), d.get("usage", 0)
+    if lim:
+        rem = max(0, lim - used)
+        return {"limit": lim, "usage": used, "remaining": rem, "pct": (rem/lim)*100}
+    return {"limit": None, "usage": used, "remaining": None, "pct": None}
+
+def stream_response(model_id, messages):
+    payload = {
+        "model": model_id,
+        "messages": [{"role":"system","content":SYSTEM_PROMPT}] + messages,
+        "stream": True,
+    }
+    resp, err = _req(f"{BASE_URL}/chat/completions", data=payload, method="POST", timeout=90)
+    if not resp:
+        yield "error", err; return
+    tokens = 0
+    try:
+        for raw in resp:
+            line = raw.decode("utf-8","replace").strip()
+            if not line.startswith("data: "): continue
+            ds = line[6:]
+            if ds == "[DONE]": break
+            try: obj = json.loads(ds)
+            except: continue
+            if obj.get("usage"):
+                tokens = obj["usage"].get("total_tokens", tokens)
+            choices = obj.get("choices", [])
+            if not choices: continue
+            chunk = choices[0].get("delta", {}).get("content", "")
+            if chunk: yield "chunk", chunk
+    except Exception as ex:
+        yield "error", {"code": 0, "body": str(ex)}; return
+    yield "done", tokens
+
+def is_rate_err(err):
+    if not err: return False
+    b = err.get("body","").lower()
+    return err.get("code",0) in (429,503,402) or any(
+        k in b for k in ["rate limit","quota","limit exceeded","exhausted",
+                          "overloaded","too many","credits","context length"])
+
+def load_config():
+    if os.path.exists(CFG_FILE):
+        try:
+            with open(CFG_FILE) as f: return json.load(f)
+        except: pass
+    return {}
+
+def save_config(cfg):
+    try:
+        with open(CFG_FILE, "w") as f: json.dump(cfg, f, indent=2)
+    except: pass
+
+# ──────────────────────────────────────────────────────
+#  CONVERSATION PERSISTENCE
+# ──────────────────────────────────────────────────────
+def _ensure_history():
+    os.makedirs(HISTORY_DIR, exist_ok=True)
+
+def save_conversation(messages, model_name=""):
+    """Auto-save conversation to ~/.orcli-history/"""
+    if not messages: return None
+    _ensure_history()
+    ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    # Generate a title from first user message
+    title = "chat"
+    for m in messages:
+        if m["role"] == "user":
+            title = re.sub(r'[^\w\s-]', '', m["content"][:40]).strip().replace(" ", "-").lower()
+            break
+    fname = f"{ts}_{title}.json"
+    path = os.path.join(HISTORY_DIR, fname)
+    try:
+        with open(path, "w") as f:
+            json.dump({"model": model_name, "messages": messages, "saved": ts}, f, indent=2)
+        return path
+    except: return None
+
+def list_conversations(limit=10):
+    """List recent saved conversations."""
+    _ensure_history()
+    files = sorted(
+        [f for f in os.listdir(HISTORY_DIR) if f.endswith(".json")],
+        reverse=True
+    )[:limit]
+    convos = []
+    for f in files:
+        try:
+            with open(os.path.join(HISTORY_DIR, f)) as fh:
+                data = json.load(fh)
+            user_msgs = [m for m in data.get("messages", []) if m["role"] == "user"]
+            preview = user_msgs[0]["content"][:60] if user_msgs else "(empty)"
+            convos.append({"file": f, "preview": preview, "count": len(data.get("messages", [])), "saved": data.get("saved", "")})
+        except: pass
+    return convos
+
+def load_conversation(filename):
+    """Load a saved conversation."""
+    path = os.path.join(HISTORY_DIR, filename)
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except: return None
+
+def read_file_content(filepath):
+    """Read a file and return its content with language detection."""
+    path = os.path.expanduser(filepath.strip())
+    if not os.path.exists(path):
+        return None, "File not found"
+    if os.path.getsize(path) > 100_000:
+        return None, "File too large (>100KB)"
+    try:
+        with open(path, "r", errors="replace") as f:
+            content = f.read()
+        ext = os.path.splitext(path)[1].lstrip(".")
+        lang_map = {"py":"python","js":"javascript","ts":"typescript","rb":"ruby",
+                    "go":"go","rs":"rust","sh":"bash","zsh":"bash","json":"json",
+                    "yml":"yaml","yaml":"yaml","md":"markdown","css":"css",
+                    "html":"html","sql":"sql","txt":"text"}
+        lang = lang_map.get(ext, ext or "text")
+        return content, lang
+    except Exception as ex:
+        return None, str(ex)
+
+def get_dir_context():
+    """Get a brief listing of current directory for smart context."""
+    try:
+        entries = os.listdir(".")
+        files = sorted([e for e in entries if os.path.isfile(e)])[:20]
+        dirs = sorted([e + "/" for e in entries if os.path.isdir(e) and not e.startswith(".")])[:10]
+        listing = dirs + files
+        if not listing: return ""
+        return "\n".join(listing[:30])
+    except: return ""
+
+def setup_auth(silent=False):
+    """Interactive API key setup. Writes to shell rc file."""
+    global API_KEY
+    if not silent:
+        print()
+        print(col("  🔑 Auth Setup", T["accent1"], BOLD))
+        print(col("  " + "─"*(tw()-4), T["muted"]))
+        print(col("  1. Go to  https://openrouter.ai/keys", T["text"]))
+        print(col("  2. Create a free key (starts with sk-or-)", T["text"]))
+        print(col("  3. Paste it below", T["text"]))
+        print()
+    try:
+        key = input(col("  Key: ", T["accent2"], BOLD)).strip()
+    except (KeyboardInterrupt, EOFError):
+        print(); return False
+    if not key:
+        print(col("  ✗ No key entered", T["error"])); return False
+    if not key.startswith("sk-or-"):
+        print(col("  ⚠ Key should start with sk-or-", T["accent6"]))
+        try:
+            confirm = input(col("  Save anyway? [y/N] ", T["muted"])).strip().lower()
+            if confirm not in ("y", "yes"): return False
+        except (KeyboardInterrupt, EOFError):
+            print(); return False
+
+    # Validate by testing the key
+    print(col("  Validating...", T["muted"], ITALIC))
+    test_hdrs = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+    test_req = urllib.request.Request(f"{BASE_URL}/auth/key", headers=test_hdrs)
+    try:
+        resp = urllib.request.urlopen(test_req, timeout=10)
+        data = json.loads(resp.read().decode()).get("data", {})
+        print(col("  ✓ Key is valid", T["accent3"], BOLD))
+        if data.get("limit"):
+            rem = max(0, data["limit"] - data.get("usage", 0))
+            print(col(f"  Balance: ${rem:.4f}", T["accent3"]))
+    except:
+        print(col("  ⚠ Could not validate (saving anyway)", T["accent6"]))
+
+    # Write to shell rc file
+    export_line = f'export OPENROUTER_API_KEY="{key}"'
+    rc = RC_FILE
+    try:
+        # Remove old key line if present
+        if os.path.exists(rc):
+            with open(rc) as f:
+                existing = f.readlines()
+            filtered = [l for l in existing if "OPENROUTER_API_KEY" not in l]
+            with open(rc, "w") as f:
+                f.writelines(filtered)
+        # Append new key
+        with open(rc, "a") as f:
+            f.write(f"\n# orcli — OpenRouter API key\n{export_line}\n")
+        print(col(f"  ✓ Saved to {os.path.basename(rc)}", T["accent3"]))
+    except Exception as ex:
+        print(col(f"  ✗ Could not write {rc}: {ex}", T["error"]))
+        print(col(f"  Add manually: {export_line}", T["accent2"]))
+        return False
+
+    # Also save to config for immediate use
+    cfg = load_config()
+    cfg["api_key"] = key
+    save_config(cfg)
+
+    # Set in current process
+    os.environ["OPENROUTER_API_KEY"] = key
+    API_KEY = key
+    print(col("  ✓ Ready! Restart orcli or run: source " + os.path.basename(rc), T["accent3"]))
+    print()
+    return True
+
+def is_coding_question(text):
+    """Detect if user's message is likely about code/files."""
+    coding_words = ["code", "file", "error", "bug", "fix", "run", "install", "build",
+                    "import", "function", "class", "script", "command", "terminal",
+                    "npm", "pip", "git", "docker", "make", "compile", "debug",
+                    "create", "write", "edit", "modify", "update", "add", "remove",
+                    "package", "dependency", "module", "project", "app", "server"]
+    low = text.lower()
+    return any(w in low for w in coding_words)
+
+# ──────────────────────────────────────────────────────
+#  DISPLAY HELPERS
+# ──────────────────────────────────────────────────────
+def banner(theme_name):
+    print()
+    print(col("  orcli", T["accent1"], BOLD) + col(f"  v{VERSION}", T["muted"]))
+    print(col(f"  Free AI · OpenRouter · {theme_name} theme", T["dim_text"]))
+    print()
+
+def print_credits():
+    cr = get_credits()
+    if not cr:
+        print(col("  ⚠ Could not fetch credits", T["accent6"])); return
+    if cr["limit"] is None:
+        print(col(f"  💰 Free tier · Used: ${cr['usage']:.5f}", T["accent3"]))
+    else:
+        pct = cr["pct"]
+        filled = int(pct / 5)
+        bar = col("●"*filled, T["accent3"]) + col("○"*(20-filled), T["muted"])
+        c_p = T["accent3"] if pct>50 else T["accent4"] if pct>20 else T["error"]
+        print(f"  {bar}{RST}  {col(f'{pct:.0f}%', c_p, BOLD)}")
+
+def print_models(models, cur=0, exhausted=None):
+    exhausted = exhausted or set()
+    print()
+    print(col("  Models", T["accent1"], BOLD) + col("  (⭐ = top coding)", T["muted"]))
+    print(col("  " + "─"*(tw()-4), T["muted"]))
+    for i, m in enumerate(models):
+        ctx  = m.get("context_length", 0)
+        cs   = f"{int(ctx)//1000}k" if ctx else "?"
+        name = m["name"][:52]
+        num  = str(i+1).rjust(3)
+        star = "⭐" if i < len(CODING_PRIORITY) else "  "
+        if i in exhausted:
+            print(col(f"  {num}. {star} {name}", T["muted"], DIM) + col(" ✗", T["error"]))
+        elif i == cur:
+            print(col(f"  {num}. {star} {name}", T["accent3"], BOLD) + col(f"  {cs}  ◀", T["accent3"]))
+        else:
+            print(col(f"  {num}.", T["muted"]) + f" {star} " + col(name, T["text"]) + col(f"  {cs}", T["muted"]))
+    print()
+
+def status_bar(model_name, avail, total, stok, msg_count):
+    """Minimal status — shown inline, not a full bar."""
+    info = col(f"  {model_name}", T["accent3"]) + col(f" · {msg_count} msgs · {stok} tok", T["muted"])
+    print(info)
+
+def print_help(theme_name):
+    cmds = [
+        ("/model",       "Switch AI model"),
+        ("/credits",     "Credit balance"),
+        ("/file PATH",   "Share a file with AI"),
+        ("/resume",      "Resume a past conversation"),
+        ("/clear",       "New conversation"),
+        ("/save",        "Save chat"),
+        ("/retry",       "Retry with next model"),
+        ("/theme NAME",  f"Change theme ({', '.join(THEMES)})"),
+        ("/mode MODE",   "safe or auto execution"),
+        ("/auth",        "Setup API key"),
+        ("/exit",        "Quit"),
+    ]
+    print()
+    print(col("  Commands", T["accent1"], BOLD))
+    print(col("  " + "─"*(tw()-4), T["muted"]))
+    for cmd, desc in cmds:
+        print(col(f"  {cmd:<16}", T["accent2"], BOLD) + col(desc, T["dim_text"]))
+    print()
+    print(col("  Tips", T["accent1"], BOLD))
+    print(col("  " + "─"*(tw()-4), T["muted"]))
+    print(col("  End line with \\ for multi-line", T["muted"]))
+    print(col("  Code blocks run locally (cd persists)", T["muted"]))
+    print(col("  Chats auto-save to ~/.orcli-history/", T["muted"]))
+    print()
+
+def print_theme_list(current):
+    print()
+    for name in THEMES:
+        marker = col("  ◀ active", T["accent3"]) if name == current else ""
+        print(col(f"  • {name}", T["accent4"], BOLD) + marker)
+    print()
+
+# ──────────────────────────────────────────────────────
+#  CHAT LOOP
+# ──────────────────────────────────────────────────────
+def chat(models, theme_name, cfg):
+    global T
+    messages    = []
+    cur         = 0
+    exhausted   = set()
+    session_tok = 0
+    last_user   = ""
+    msg_count   = 0
+
+    # Welcome back greeting
+    convos = list_conversations(1)
+    if convos:
+        print()
+        print(col("  Welcome back 👋", T["accent1"], BOLD))
+        print(col(f"  Last chat: {convos[0]['preview'][:50]}", T["muted"]))
+        print(col("  /resume to continue  ·  /help for commands", T["muted"]))
+    else:
+        print()
+        print(col("  💬 Chat started", T["accent1"], BOLD) + col("  ·  /help for commands", T["muted"]))
+    print(col("  " + "─"*(tw()-4), T["muted"]))
+
+    while True:
+        if cur in exhausted:
+            for i in range(len(models)):
+                if i not in exhausted: cur = i; break
+
+        if len(exhausted) >= len(models):
+            print(col("\n  All models exhausted. Try again later 🌙", T["error"]))
+            sys.exit(0)
+
+        # Prompt (Messenger Style: clean message box)
+        print()
+        try:
+            cwd_short = os.path.basename(os.getcwd()) or "/"
+            lines = []; first = True
+            while True:
+                if first:
+                    pfx = col(f"  {cwd_short}", T["muted"]) + col(" › ", T["accent1"], BOLD)
+                else:
+                    pfx = col("    … ", T["muted"])
+                first = False
+                part = input(pfx).rstrip()
+                if part.endswith("\\"):
+                    lines.append(part[:-1])
+                else:
+                    lines.append(part); break
+            user_input = "\n".join(lines).strip()
+        except (KeyboardInterrupt, EOFError):
+            print(col("\n\n👋 Goodbye!\n", T["accent3"], BOLD))
+            show_cursor(); sys.exit(0)
+
+        if not user_input: continue
+        low = user_input.lower().strip()
+
+        # Commands
+        if low in ("/exit", "/quit"):
+            save_conversation(messages, models[cur]["name"] if models else "")
+            print(col("\n  👋 Bye!\n", T["accent3"])); show_cursor(); sys.exit(0)
+        elif low == "/help":
+            print_help(theme_name); continue
+        elif low == "/clear":
+            save_conversation(messages, models[cur]["name"] if models else "")
+            messages = []; last_user = ""; msg_count = 0
+            print(col("  ✓ Cleared (saved)", T["accent3"])); continue
+        elif low == "/credits":
+            print_credits(); continue
+        elif low == "/auth":
+            setup_auth(); continue
+        elif low == "/history":
+            if not messages:
+                print(col("  (no history yet)", T["muted"]))
+            else:
+                for msg in messages:
+                    who  = col("  You: ", T["accent1"], BOLD) if msg["role"]=="user" else col("  AI:  ", T["accent3"], BOLD)
+                    snip = msg["content"][:200].replace("\n"," ")
+                    print(who + col(snip + ("…" if len(msg["content"])>200 else ""), T["dim_text"]))
+            continue
+        elif low == "/resume":
+            convos = list_conversations(10)
+            if not convos:
+                print(col("  No saved conversations", T["muted"])); continue
+            print()
+            print(col("  Recent chats", T["accent1"], BOLD))
+            print(col("  " + "─"*(tw()-4), T["muted"]))
+            for i, c in enumerate(convos, 1):
+                ts_display = c["saved"][:8] if c["saved"] else "?"
+                print(col(f"  {i:>2}.", T["muted"]) + col(f" {c['preview'][:50]}", T["text"]) + col(f"  ({c['count']} msgs)", T["muted"]))
+            print()
+            try:
+                ch = input(col("  # ", T["accent1"], BOLD)).strip()
+                if ch:
+                    idx = int(ch) - 1
+                    if 0 <= idx < len(convos):
+                        data = load_conversation(convos[idx]["file"])
+                        if data and data.get("messages"):
+                            messages = data["messages"]
+                            msg_count = len([m for m in messages if m["role"] == "user"])
+                            print(col(f"  ✓ Resumed ({msg_count} messages loaded)", T["accent3"]))
+                        else:
+                            print(col("  Could not load", T["error"]))
+            except (ValueError, KeyboardInterrupt): pass
+            continue
+        elif low.startswith("/file"):
+            parts = user_input.split(None, 1)
+            if len(parts) < 2:
+                print(col("  Usage: /file path/to/file", T["muted"])); continue
+            filepath = parts[1].strip()
+            content, info = read_file_content(filepath)
+            if content is None:
+                print(col(f"  ✗ {info}", T["error"])); continue
+            basename = os.path.basename(filepath)
+            line_count = content.count("\n") + 1
+            print(col(f"  📎 {basename}", T["accent2"], BOLD) + col(f"  ({line_count} lines, {info})", T["muted"]))
+            file_msg = f"Here is the file `{basename}` ({info}, {line_count} lines):\n\n```{info}\n{content}\n```\n\nPlease review this file. What would you like to know about it?"
+            messages.append({"role": "user", "content": file_msg})
+            user_input = file_msg
+            # Fall through to AI response
+        elif low == "/save":
+            path = save_conversation(messages, models[cur]["name"] if models else "")
+            if path:
+                print(col(f"  ✓ Saved → {os.path.basename(path)}", T["accent3"]))
+            else:
+                print(col("  Nothing to save", T["muted"]))
+            continue
+        elif low == "/retry":
+            if not last_user:
+                print(col("  ⚠ Nothing to retry", T["accent6"])); continue
+            if messages and messages[-1]["role"] == "assistant": messages.pop()
+            if messages and messages[-1]["role"] == "user":      messages.pop()
+            user_input = last_user
+            print(col(f"  🔁 Retrying...", T["accent6"]))
+        elif low == "/model":
+            print_models(models, cur, exhausted)
+            try:
+                ch = input(col("  # ", T["accent1"], BOLD)).strip()
+                if ch:
+                    idx = int(ch) - 1
+                    if 0 <= idx < len(models) and idx not in exhausted:
+                        cur = idx
+                        short = models[cur]['name'].split('/')[-1] if '/' in models[cur]['name'] else models[cur]['name']
+                        print(col(f"  ✓ → {short}", T["accent3"]))
+                    else:
+                        print(col("  ⚠ Invalid or exhausted", T["accent6"]))
+            except (ValueError, KeyboardInterrupt): pass
+            continue
+        elif low.startswith("/theme"):
+            parts = low.split()
+            if len(parts) < 2:
+                print_theme_list(theme_name)
+            else:
+                new_t = parts[1].lower()
+                if new_t in THEMES:
+                    T = THEMES[new_t]; theme_name = new_t
+                    cfg["theme"] = new_t; save_config(cfg)
+                    print(col(f"  ✓ Theme → {new_t}", T["accent3"]))
+                else:
+                    print(col(f"  ⚠ Unknown: {', '.join(THEMES)}", T["accent6"]))
+        elif low.startswith("/mode"):
+            parts = low.split()
+            if len(parts) < 2:
+                current_mode = cfg.get("mode", "safe")
+                print(col(f"  Mode: {current_mode}  (safe / auto)", T["accent4"]))
+            else:
+                new_m = parts[1].lower()
+                if new_m in ("safe", "auto"):
+                    cfg["mode"] = new_m; save_config(cfg)
+                    print(col(f"  ✓ Mode → {new_m}", T["accent3"]))
+                else:
+                    print(col("  ⚠ Use: /mode safe  or  /mode auto", T["accent6"]))
+            continue
+
+
+        last_user = user_input
+
+        # Smart context: auto-inject directory listing for coding questions
+        actual_content = user_input
+        if not low.startswith("/file") and is_coding_question(user_input):
+            dir_ctx = get_dir_context()
+            if dir_ctx:
+                actual_content = user_input + f"\n\n[Current directory: {os.getcwd()}]\n[Files here:]\n{dir_ctx}"
+
+        # Only append if not already added (e.g., /file already appended)
+        if not messages or messages[-1].get("content") != user_input:
+            messages.append({"role": "user", "content": actual_content})
+        msg_count += 1
+
+        # Echo user message as sent bubble with timestamp
+        ts_sent = datetime.datetime.now().strftime("%H:%M")
+        echo_text = user_input[:120] + ("…" if len(user_input) > 120 else "")
+        if not low.startswith("/file"):
+            print(col(f"  You", T["accent1"], BOLD) + col(f"  {ts_sent}", T["muted"]))
+            for eline in echo_text.split("\n"):
+                print(col(f"    {eline}", T["dim_text"]))
+        print(col(f"  ✓✓ seen", T["muted"], ITALIC))
+
+        replied = False; tried = set()
+        while not replied:
+            if len(exhausted) >= len(models): break
+            if cur in exhausted or cur in tried:
+                found = False
+                for i in range(len(models)):
+                    if i not in exhausted and i not in tried:
+                        cur = i; found = True; break
+                if not found: break
+
+            tried.add(cur)
+            model = models[cur]
+            mname = model["name"]
+
+            # AI bubble header — clean and minimal
+            print()
+            short_name = mname.split("/")[-1] if "/" in mname else mname
+            print(col(f"  {short_name}", T["accent3"], BOLD))
+
+            full_text   = ""; in_think = False; think_open = False
+            text_buf    = ""; got_error = None; tokens = 0
+
+            sp = Spinner("AI is typing")
+            sp.start(); first_chunk = True
+
+            # Loop detector
+            recent_lines  = []; loop_detected = False
+            LOOP_WIN, LOOP_THR = 6, 3
+
+            def _check_loop(ln):
+                nonlocal loop_detected
+                s = re.sub(r'\033\[[^m]*m', '', ln).strip()
+                if not s: return False
+                recent_lines.append(s)
+                if len(recent_lines) > LOOP_WIN*2: recent_lines.pop(0)
+                if len(recent_lines) >= LOOP_WIN:
+                    from collections import Counter
+                    top = Counter(recent_lines[-LOOP_WIN:]).most_common(1)[0]
+                    if top[1] >= LOOP_THR:
+                        loop_detected = True; return True
+                return False
+
+            for event, data in stream_response(model["id"], messages):
+                if loop_detected: break
+                if first_chunk and event in ("chunk","done","error"):
+                    sp.stop(); first_chunk = False
+
+                if event == "chunk":
+                    full_text += data; text_buf += data
+                    while True:
+                        if not in_think:
+                            ts = text_buf.find("<think>")
+                            if ts != -1:
+                                pre = text_buf[:ts]
+                                if pre.strip():
+                                    sys.stdout.write(render_md(pre)); sys.stdout.flush()
+                                text_buf = text_buf[ts+7:]
+                                in_think = True; think_open = True; think_header()
+                            else:
+                                if "\n" in text_buf:
+                                    parts = text_buf.split("\n")
+                                    for ln in parts[:-1]:
+                                        sys.stdout.write(render_md(ln) + "\n")
+                                        sys.stdout.flush()
+                                        if _check_loop(ln): break
+                                    text_buf = parts[-1]
+                                break
+                        else:
+                            te = text_buf.find("</think>")
+                            if te != -1:
+                                for ln in text_buf[:te].split("\n"): think_line(ln)
+                                think_footer(); think_open = False
+                                text_buf = text_buf[te+8:]; in_think = False
+                            else:
+                                if "\n" in text_buf:
+                                    parts = text_buf.split("\n")
+                                    for ln in parts[:-1]: think_line(ln)
+                                    text_buf = parts[-1]
+                                break
+
+                elif event == "done":
+                    if first_chunk: sp.stop(); first_chunk = False
+                    tokens = data
+                    if think_open: think_footer()
+                    if text_buf.strip():
+                        sys.stdout.write(render_md(text_buf) + "\n"); sys.stdout.flush()
+                    replied = True
+
+                elif event == "error":
+                    if first_chunk: sp.stop(); first_chunk = False
+                    got_error = data; break
+
+            if loop_detected and not replied:
+                if first_chunk: sp.stop()
+                print(col(f"\n  🔁 Loop detected, switching...", T["accent6"]))
+                exhausted.add(cur)
+                if messages and messages[-1]["role"] == "assistant": messages.pop()
+                continue
+
+            if replied:
+                session_tok += tokens
+                # Timestamp + delivered indicator like Messenger
+                ts_str = datetime.datetime.now().strftime("%H:%M")
+                tok_label = f"{tokens}" if tokens else ""
+                print(col(f"\n  {ts_str}  ✓", T["muted"]) + (col(f"  {tok_label} tok", T["muted"]) if tok_label else ""))
+                print(col("  " + "─"*(tw()-4), T["muted"]))
+                messages.append({"role": "assistant", "content": full_text})
+
+                # Auto-save conversation after each exchange
+                save_conversation(messages, mname)
+
+                # TRIGGER COMMAND EXECUTION
+                execute_code_blocks(full_text, cfg)
+
+            elif got_error:
+                if is_rate_err(got_error):
+                    print(col(f"\n  ⚡ Rate limited, switching...", T["accent6"]))
+                    exhausted.add(cur)
+                else:
+                    body = got_error.get("body","?")[:160]
+                    print(col(f"\n  ❌  Error ({got_error.get('code','?')}): {body}", T["error"]))
+                    messages.pop(); break
+
+        if not replied and len(exhausted) >= len(models):
+            save_conversation(messages, "exhausted")
+            print(col("\n  All models exhausted 🌙", T["error"]))
+            sys.exit(0)
+
+# ──────────────────────────────────────────────────────
+#  MAIN
+# ──────────────────────────────────────────────────────
+def main():
+    global T
+    parser = argparse.ArgumentParser(prog="orcli", add_help=False)
+    parser.add_argument("--theme", default=None)
+    parser.add_argument("--list-themes", action="store_true")
+    parser.add_argument("--auth", action="store_true", help="Setup API key")
+    args, _ = parser.parse_known_args()
+
+    cfg = load_config()
+    if args.list_themes:
+        print("\n  Available themes: " + ", ".join(THEMES.keys()) + "\n"); sys.exit(0)
+
+    theme_name = args.theme or cfg.get("theme", "ark")
+    if theme_name not in THEMES: theme_name = "ark"
+    T = THEMES[theme_name]
+
+    # Clean Messenger-style startup
+    print()
+    print(col("  orcli", T["accent1"], BOLD) + col(f"  v{VERSION}", T["muted"]))
+    print(col("  " + "─"*(tw()-4), T["muted"]))
+
+    # Handle --auth flag
+    if args.auth:
+        setup_auth()
+        sys.exit(0)
+
+    # Try loading key from config if env var is empty
+    if not API_KEY:
+        cfg_key = cfg.get("api_key", "")
+        if cfg_key:
+            API_KEY = cfg_key
+            os.environ["OPENROUTER_API_KEY"] = cfg_key
+
+    if not API_KEY:
+        print(col("  No API key found", T["accent6"]))
+        print(col("  Let's set one up:", T["muted"]))
+        if setup_auth():
+            API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+        if not API_KEY:
+            print(col("  Run: orcli --auth\n", T["muted"]))
+            sys.exit(1)
+
+    print_credits()
+    models = get_models()
+    if not models:
+        print(col("  No free models found.", T["error"])); sys.exit(1)
+
+    # Just show the active model, not the full list
+    print(col(f"  {len(models)} models", T["accent3"]) + col("  ·  /model to browse", T["muted"]))
+    print(col(f"  → {models[0]['name']}", T["accent3"], BOLD))
+    print()
+
+    # Check for direct arguments or piped input
+    direct_query = ""
+    if len(sys.argv) > 1 and not sys.argv[1].startswith("-"):
+        direct_query = " ".join(sys.argv[1:])
+    elif not sys.stdin.isatty():
+        direct_query = sys.stdin.read().strip()
+
+    if direct_query:
+        # Run a single query non-interactively
+        model = models[0]
+        short_name = model['name'].split('/')[-1] if '/' in model['name'] else model['name']
+        print(col(f"  {short_name}", T["accent3"], BOLD))
+        
+        full_text = ""
+        in_think = False
+        text_buf = ""
+        think_open = False
+        
+        for event, data in stream_response(model["id"], [{"role": "user", "content": direct_query}]):
+            if event == "chunk":
+                full_text += data
+                text_buf += data
+                while True:
+                    if not in_think:
+                        ts = text_buf.find("<think>")
+                        if ts != -1:
+                            pre = text_buf[:ts]
+                            if pre.strip():
+                                sys.stdout.write(render_md(pre))
+                                sys.stdout.flush()
+                            text_buf = text_buf[ts+7:]
+                            in_think = True
+                            think_open = True
+                            think_header()
+                        else:
+                            if "\n" in text_buf:
+                                parts = text_buf.split("\n")
+                                for ln in parts[:-1]:
+                                    sys.stdout.write(render_md(ln) + "\n")
+                                    sys.stdout.flush()
+                                text_buf = parts[-1]
+                            break
+                    else:
+                        te = text_buf.find("</think>")
+                        if te != -1:
+                            for ln in text_buf[:te].split("\n"):
+                                think_line(ln)
+                            think_footer()
+                            think_open = False
+                            text_buf = text_buf[te+8:]
+                            in_think = False
+                        else:
+                            if "\n" in text_buf:
+                                parts = text_buf.split("\n")
+                                for ln in parts[:-1]:
+                                    think_line(ln)
+                                text_buf = parts[-1]
+                            break
+            elif event == "done":
+                if think_open:
+                    think_footer()
+                if text_buf.strip():
+                    sys.stdout.write(render_md(text_buf) + "\n")
+                    sys.stdout.flush()
+                break
+            elif event == "error":
+                print(col(f"\n❌ Error: {data.get('body', 'unknown')}", T["error"]))
+                sys.exit(1)
+        
+        print(col(f"\n  {datetime.datetime.now():%H:%M}  ✓", T["muted"]))
+        execute_code_blocks(full_text, cfg)
+        sys.exit(0)
+
+    try:
+        chat(models, theme_name, cfg)
+    except KeyboardInterrupt:
+        print(col("\n\n  👋 Bye!\n", T["accent3"]))
+        show_cursor()
+
+if __name__ == "__main__":
+    main()
